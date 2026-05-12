@@ -608,17 +608,23 @@ class GPIPDContinuousAction(MOAgent, MOPolicy):
 
             # --- episode handling ---
             if is_vector:
-                final_infos = infos.get("final_info", ())
-                for i, final_info in enumerate(final_infos):
-                    if final_info is not None:
-                        self.num_episodes += 1
-                        ep_info = final_info.get("episode")
-                        if ep_info:
+                if "episode" in infos:
+                    ep_data = infos["episode"]
+                    done_mask = infos.get("_episode", np.zeros(num_envs, dtype=bool))
+                    for i in range(num_envs):
+                        if done_mask[i]:
+                            self.num_episodes += 1
+                            ep_info = {
+                                "r": ep_data["r"][i],
+                                "dr": ep_data["dr"][i],
+                                "l": int(ep_data["l"][i]),
+                                "t": float(ep_data["t"][i]),
+                            }
                             log_episode_info(ep_info, np.dot, weight, self.global_step, verbose=True)
-                        ep_returns[i] = 0.0
-                        if change_weight_every_episode:
-                            weight = random.choice(weight_support)
-                            tensor_w = th.tensor(weight).float().to(self.device)
+                            ep_returns[i] = 0.0
+                            if change_weight_every_episode:
+                                weight = random.choice(weight_support)
+                                tensor_w = th.tensor(weight).float().to(self.device)
             else:
                 if terminateds or truncateds:
                     obs, _ = self.env.reset()
