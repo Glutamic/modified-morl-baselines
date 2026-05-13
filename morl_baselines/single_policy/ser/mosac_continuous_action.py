@@ -26,7 +26,7 @@ from morl_baselines.common.networks import layer_init, mlp, polyak_update
 
 # ALGO LOGIC: initialize agent here:
 class MOSoftQNetwork(nn.Module):
-    """Soft Q-network: S, A -> ... -> |R| (multi-objective)."""
+    """Soft Q-network: S, A, (W) -> ... -> |R| (multi-objective)."""
 
     def __init__(
         self,
@@ -34,26 +34,48 @@ class MOSoftQNetwork(nn.Module):
         action_shape,
         reward_dim,
         net_arch=[256, 256],
+        conditioned_on_weight: bool = False,
     ):
-        """Initialize the soft Q-network."""
+        """Initialize the soft Q-network.
+
+        Args:
+            conditioned_on_weight: If True, weight vector is concatenated to input.
+        """
         super().__init__()
         self.obs_shape = obs_shape
         self.action_shape = action_shape
         self.reward_dim = reward_dim
         self.net_arch = net_arch
+        self.conditioned_on_weight = conditioned_on_weight
 
-        # S, A -> ... -> |R| (multi-objective)
+        obs_dim = np.array(self.obs_shape).prod()
+        act_dim = np.prod(self.action_shape)
+        input_dim = obs_dim + act_dim
+        if conditioned_on_weight:
+            input_dim += reward_dim
+
         self.critic = mlp(
-            input_dim=np.array(self.obs_shape).prod() + np.prod(self.action_shape),
+            input_dim=input_dim,
             output_dim=self.reward_dim,
             net_arch=self.net_arch,
             activation_fn=nn.ReLU,
         )
         self.apply(layer_init)
 
-    def forward(self, x, a):
-        """Forward pass of the soft Q-network."""
-        x = th.cat([x, a], dim=-1)
+    def forward(self, x, a, w=None):
+        """Forward pass of the soft Q-network.
+
+        Args:
+            x: observation
+            a: action
+            w: weight vector (optional, used when conditioned_on_weight=True)
+        """
+        if self.conditioned_on_weight and w is not None:
+            if w.dim() == 1:
+                w = w.unsqueeze(0).expand(x.shape[0], -1)
+            x = th.cat([x, a, w], dim=-1)
+        else:
+            x = th.cat([x, a], dim=-1)
         x = self.critic(x)
         return x
 
@@ -63,7 +85,7 @@ LOG_STD_MIN = -5
 
 
 class MOSACActor(nn.Module):
-    """Actor network: S -> A. Does not need any multi-objective concept."""
+    """Actor network: S, (W) -> A."""
 
     def __init__(
         self,
@@ -73,17 +95,26 @@ class MOSACActor(nn.Module):
         action_lower_bound,
         action_upper_bound,
         net_arch=[256, 256],
+        conditioned_on_weight: bool = False,
     ):
-        """Initialize SAC actor."""
+        """Initialize SAC actor.
+
+        Args:
+            conditioned_on_weight: If True, weight vector is concatenated to obs.
+        """
         super().__init__()
         self.obs_shape = obs_shape
         self.action_shape = action_shape
         self.reward_dim = reward_dim
         self.net_arch = net_arch
+        self.conditioned_on_weight = conditioned_on_weight
 
-        # S -> ... -> |A| (mean)
-        #          -> |A| (std)
-        self.latent_pi = mlp(np.array(self.obs_shape).prod(), -1, self.net_arch)
+        obs_dim = np.array(self.obs_shape).prod()
+        input_dim = obs_dim
+        if conditioned_on_weight:
+            input_dim += reward_dim
+
+        self.latent_pi = mlp(input_dim, -1, self.net_arch)
         self.fc_mean = nn.Linear(net_arch[-1], np.prod(self.action_shape))
         self.fc_logstd = nn.Linear(net_arch[-1], np.prod(self.action_shape))
         self.apply(layer_init)
@@ -97,8 +128,17 @@ class MOSACActor(nn.Module):
             th.tensor((action_upper_bound + action_lower_bound) / 2.0, dtype=th.float32),
         )
 
-    def forward(self, x):
+    def _maybe_concat_w(self, x, w):
+        """Concatenate weight vector to input if conditioning is enabled."""
+        if self.conditioned_on_weight and w is not None:
+            if w.dim() == 1:
+                w = w.unsqueeze(0).expand(x.shape[0], -1)
+            return th.cat((x, w), dim=-1)
+        return x
+
+    def forward(self, x, w=None):
         """Forward pass of the actor network."""
+        x = self._maybe_concat_w(x, w)
         x = self.latent_pi(x)
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
@@ -107,9 +147,9 @@ class MOSACActor(nn.Module):
 
         return mean, log_std
 
-    def get_action(self, x):
+    def get_action(self, x, w=None):
         """Get action from the actor network."""
-        mean, log_std = self(x)
+        mean, log_std = self(x, w)
         std = log_std.exp()
         normal = th.distributions.Normal(mean, std)
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
@@ -150,6 +190,7 @@ class MOSAC(MOPolicy):
         device: Union[th.device, str] = "auto",
         log: bool = True,
         seed: int = 42,
+        conditioned_on_weight: bool = False,
         parent_rng: Optional[np.random.Generator] = None,
     ):
         """Initialize the MOSAC algorithm.
@@ -186,6 +227,9 @@ class MOSAC(MOPolicy):
         else:
             self.np_random = np.random.default_rng(self.seed)
 
+        # Conditioned on weight
+        self.conditioned_on_weight = conditioned_on_weight
+
         # env setup
         self.env = env
         assert isinstance(self.env.action_space, gym.spaces.Box), "only continuous action space is supported"
@@ -218,6 +262,7 @@ class MOSAC(MOPolicy):
             action_lower_bound=self.env.action_space.low,
             action_upper_bound=self.env.action_space.high,
             net_arch=self.net_arch,
+            conditioned_on_weight=self.conditioned_on_weight,
         ).to(self.device)
 
         self.qf1 = MOSoftQNetwork(
@@ -225,24 +270,28 @@ class MOSAC(MOPolicy):
             action_shape=self.action_shape,
             reward_dim=self.reward_dim,
             net_arch=self.net_arch,
+            conditioned_on_weight=self.conditioned_on_weight,
         ).to(self.device)
         self.qf2 = MOSoftQNetwork(
             obs_shape=self.obs_shape,
             action_shape=self.action_shape,
             reward_dim=self.reward_dim,
             net_arch=self.net_arch,
+            conditioned_on_weight=self.conditioned_on_weight,
         ).to(self.device)
         self.qf1_target = MOSoftQNetwork(
             obs_shape=self.obs_shape,
             action_shape=self.action_shape,
             reward_dim=self.reward_dim,
             net_arch=self.net_arch,
+            conditioned_on_weight=self.conditioned_on_weight,
         ).to(self.device)
         self.qf2_target = MOSoftQNetwork(
             obs_shape=self.obs_shape,
             action_shape=self.action_shape,
             reward_dim=self.reward_dim,
             net_arch=self.net_arch,
+            conditioned_on_weight=self.conditioned_on_weight,
         ).to(self.device)
         self.qf1_target.requires_grad_(False)
         self.qf2_target.requires_grad_(False)
@@ -319,6 +368,7 @@ class MOSAC(MOPolicy):
             device=self.device,
             log=self.log,
             seed=self.seed,
+            conditioned_on_weight=self.conditioned_on_weight,
             parent_rng=self.parent_rng,
         )
 
@@ -422,7 +472,10 @@ class MOSAC(MOPolicy):
         obs = th.as_tensor(obs).float().to(self.device)
         obs = obs.unsqueeze(0)
         with th.no_grad():
-            action, _, _ = self.actor.get_action(obs)
+            if self.conditioned_on_weight:
+                action, _, _ = self.actor.get_action(obs, self.weights_tensor)
+            else:
+                action, _, _ = self.actor.get_action(obs)
 
         return action[0].detach().cpu().numpy()
 
@@ -433,16 +486,16 @@ class MOSAC(MOPolicy):
         )
 
         with th.no_grad():
-            next_state_actions, next_state_log_pi, _ = self.actor.get_action(mb_next_obs)
+            next_state_actions, next_state_log_pi, _ = self.actor.get_action(mb_next_obs, self.weights_tensor if self.conditioned_on_weight else None)
             # (!) Q values are scalarized before being compared (min of ensemble networks)
-            qf1_next_target = self.scalarization(self.qf1_target(mb_next_obs, next_state_actions), self.weights_tensor)
-            qf2_next_target = self.scalarization(self.qf2_target(mb_next_obs, next_state_actions), self.weights_tensor)
+            qf1_next_target = self.scalarization(self.qf1_target(mb_next_obs, next_state_actions, self.weights_tensor if self.conditioned_on_weight else None), self.weights_tensor)
+            qf2_next_target = self.scalarization(self.qf2_target(mb_next_obs, next_state_actions, self.weights_tensor if self.conditioned_on_weight else None), self.weights_tensor)
             min_qf_next_target = th.min(qf1_next_target, qf2_next_target) - (self.alpha_tensor * next_state_log_pi).flatten()
             scalarized_rewards = self.scalarization(mb_rewards, self.weights_tensor)
             next_q_value = scalarized_rewards.flatten() + (1 - mb_dones.flatten()) * self.gamma * min_qf_next_target
 
-        qf1_a_values = self.scalarization(self.qf1(mb_obs, mb_act), self.weights_tensor).flatten()
-        qf2_a_values = self.scalarization(self.qf2(mb_obs, mb_act), self.weights_tensor).flatten()
+        qf1_a_values = self.scalarization(self.qf1(mb_obs, mb_act, self.weights_tensor if self.conditioned_on_weight else None), self.weights_tensor).flatten()
+        qf2_a_values = self.scalarization(self.qf2(mb_obs, mb_act, self.weights_tensor if self.conditioned_on_weight else None), self.weights_tensor).flatten()
         qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
         qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
         qf_loss = qf1_loss + qf2_loss
@@ -453,10 +506,10 @@ class MOSAC(MOPolicy):
 
         if self.global_step % self.policy_freq == 0:  # TD 3 Delayed update support
             for _ in range(self.policy_freq):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                pi, log_pi, _ = self.actor.get_action(mb_obs)
+                pi, log_pi, _ = self.actor.get_action(mb_obs, self.weights_tensor if self.conditioned_on_weight else None)
                 # (!) Q values are scalarized before being compared (min of ensemble networks)
-                qf1_pi = self.scalarization(self.qf1(mb_obs, pi), self.weights_tensor)
-                qf2_pi = self.scalarization(self.qf2(mb_obs, pi), self.weights_tensor)
+                qf1_pi = self.scalarization(self.qf1(mb_obs, pi, self.weights_tensor if self.conditioned_on_weight else None), self.weights_tensor)
+                qf2_pi = self.scalarization(self.qf2(mb_obs, pi, self.weights_tensor if self.conditioned_on_weight else None), self.weights_tensor)
                 min_qf_pi = th.min(qf1_pi, qf2_pi).view(-1)
                 actor_loss = ((self.alpha_tensor * log_pi) - min_qf_pi).mean()
 
@@ -466,7 +519,7 @@ class MOSAC(MOPolicy):
 
                 if self.autotune:
                     with th.no_grad():
-                        _, log_pi, _ = self.actor.get_action(mb_obs)
+                        _, log_pi, _ = self.actor.get_action(mb_obs, self.weights_tensor if self.conditioned_on_weight else None)
                     alpha_loss = (-self.log_alpha * (log_pi + self.target_entropy)).mean()
 
                     self.a_optimizer.zero_grad(set_to_none=True)
@@ -526,7 +579,7 @@ class MOSAC(MOPolicy):
             else:
                 th_obs = th.as_tensor(obs).float().to(self.device)
                 th_obs = th_obs.unsqueeze(0)
-                actions, _, _ = self.actor.get_action(th_obs)
+                actions, _, _ = self.actor.get_action(th_obs, self.weights_tensor if self.conditioned_on_weight else None)
                 actions = actions[0].detach().cpu().numpy()
 
             # execute the game and log data
